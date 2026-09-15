@@ -14,3 +14,4 @@ downloads
 Assets
 logs.txt
 config.env
+venv/
