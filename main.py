@@ -134,7 +134,7 @@ async def start(_, message: Message):
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
     )
-    await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
+    await message.reply(welcome_text, reply_markup=markup)
 
 
 @bot.on_message(filters.command("help") & filters.private)
@@ -184,6 +184,314 @@ async def cleanup_storage(_, message: Message):
     except Exception as e:
         LOGGER(__name__).error(f"Cleanup failed: {e}")
         return await message.reply("❌ **Cleanup failed.** Check logs for details.")
+
+async def process_topic_media(
+    bot,
+    message,
+    chat_message,
+    effective_forward_chat_id,
+):
+    message_id = chat_message.id
+
+    try:
+        if chat_message.document or chat_message.video or chat_message.audio:
+            file_size = (
+                chat_message.document.file_size
+                if chat_message.document
+                else chat_message.video.file_size
+                if chat_message.video
+                else chat_message.audio.file_size
+            )
+
+            if not await fileSizeLimit(
+                file_size, message, "download", user.me.is_premium
+            ):
+                return
+
+        raw_caption, raw_caption_entities = get_raw_text(
+            chat_message.caption, chat_message.caption_entities
+        )
+
+        start_time = time()
+        progress_message = await message.reply(
+            f"**📥 Downloading message {message_id}...**"
+        )
+
+        filename = get_file_name(message_id, chat_message)
+        download_path = get_download_path(message.id, filename)
+
+        media_path = None
+
+        for attempt in range(2):
+            try:
+                media_path = await chat_message.download(
+                    file_name=download_path,
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📥 Downloading Progress",
+                        progress_message,
+                        start_time,
+                    ),
+                )
+                break
+            except FloodWait as e:
+                wait_s = int(getattr(e, "value", 0) or 0)
+                if wait_s > 0 and attempt == 0:
+                    await asyncio.sleep(wait_s + 1)
+                    continue
+                raise
+
+        if not media_path or not os.path.exists(media_path):
+            await progress_message.edit(
+                "**❌ Download failed: File not saved properly**"
+            )
+            return
+
+        file_size = os.path.getsize(media_path)
+
+        if file_size == 0:
+            await progress_message.edit(
+                "**❌ Download failed: File is empty**"
+            )
+            cleanup_download(media_path)
+            return
+
+        media_type = (
+            "photo"
+            if chat_message.photo
+            else "video"
+            if chat_message.video
+            else "audio"
+            if chat_message.audio
+            else "document"
+        )
+
+        await send_media(
+            bot,
+            message,
+            media_path,
+            media_type,
+            raw_caption,
+            raw_caption_entities,
+            progress_message,
+            start_time,
+            forward_chat_id=effective_forward_chat_id,
+        )
+
+        cleanup_download(media_path)
+        await progress_message.delete()
+
+    except Exception as e:
+        LOGGER(__name__).error(
+            f"Failed processing topic media message {message_id}: {e}"
+        )
+async def handle_topic_download(bot: Client, message: Message, topic_url: str):
+    global forward_chat_id
+
+    async with download_semaphore:
+        if "?" in topic_url:
+            topic_url = topic_url.split("?", 1)[0]
+
+        try:
+            parts = topic_url.rstrip("/").split("/")
+
+            if len(parts) != 7 or parts[3] != "c":
+                await message.reply(
+                    "**❌ Invalid Forum Topic link.**\n\n"
+                    "Expected:\n"
+                    "`/topic https://t.me/c/<chat>/<topic>/<message>`"
+                )
+                return
+
+            chat_id = getChatMsgID(topic_url)[0]
+            topic_id = int(parts[5])
+
+            status = await message.reply(
+                f"📥 **Scanning Forum Topic `{topic_id}`...**"
+            )
+
+            topic_messages = []
+
+            async for msg in user.get_chat_history(chat_id):
+                if msg.id < topic_id:
+                    break
+
+                if msg.reply_to_message_id == topic_id:
+                    topic_messages.append(msg)
+
+            topic_messages.reverse()
+
+            if not topic_messages:
+                await status.edit(
+                    "**❌ No messages found in this Forum Topic.**"
+                )
+                return
+
+            LOGGER(__name__).info(
+                f"Forum Topic {topic_id}: found "
+                f"{len(topic_messages)} message(s)"
+            )
+
+            await status.edit(
+                f"📥 **Topic found:** `{len(topic_messages)}` messages\n"
+                f"⏳ Starting download..."
+            )
+
+            completed = 0
+
+            for topic_msg in topic_messages:
+
+                # Check if task was cancelled
+                await asyncio.sleep(0)
+
+                try:
+                    # ---------------- TEXT MESSAGE ----------------
+                    if topic_msg.text and not topic_msg.media:
+                        await bot.send_message(
+                            chat_id=message.chat.id,
+                            text=topic_msg.text,
+                            entities=topic_msg.entities
+                        )
+
+                        completed += 1
+                        continue
+
+                    # ---------------- MEDIA MESSAGE ----------------
+                    if topic_msg.media:
+
+                        media = None
+                        filename = f"media_{topic_msg.id}"
+
+                        if topic_msg.document:
+                            media = topic_msg.document
+                            filename = (
+                                topic_msg.document.file_name
+                                or f"document_{topic_msg.id}"
+                            )
+
+                        elif topic_msg.video:
+                            media = topic_msg.video
+                            filename = (
+                                topic_msg.video.file_name
+                                or f"video_{topic_msg.id}.mp4"
+                            )
+
+                        elif topic_msg.audio:
+                            media = topic_msg.audio
+                            filename = (
+                                topic_msg.audio.file_name
+                                or f"audio_{topic_msg.id}"
+                            )
+
+                        elif topic_msg.photo:
+                            media = topic_msg.photo
+                            filename = f"photo_{topic_msg.id}.jpg"
+
+                        if media:
+
+                            # Download
+                            LOGGER(__name__).info(
+                                f"Topic {topic_id}: downloading "
+                                f"message {topic_msg.id}"
+                            )
+
+                            file_path = await user.download_media(
+                                topic_msg,
+                                file_name=get_download_path(message.id, filename)
+                                    
+                            )
+
+                            if not file_path:
+                                LOGGER(__name__).error(
+                                    f"Failed to download message "
+                                    f"{topic_msg.id}"
+                                )
+                                continue
+
+                            caption = topic_msg.caption or ""
+
+                            # Upload according to media type
+                            if topic_msg.document:
+                                await bot.send_document(
+                                    chat_id=message.chat.id,
+                                    document=file_path,
+                                    caption=caption
+                                )
+
+                            elif topic_msg.video:
+                                await bot.send_video(
+                                    chat_id=message.chat.id,
+                                    video=file_path,
+                                    caption=caption
+                                )
+
+                            elif topic_msg.audio:
+                                await bot.send_audio(
+                                    chat_id=message.chat.id,
+                                    audio=file_path,
+                                    caption=caption
+                                )
+
+                            elif topic_msg.photo:
+                                await bot.send_photo(
+                                    chat_id=message.chat.id,
+                                    photo=file_path,
+                                    caption=caption
+                                )
+
+                            completed += 1
+
+                            # Delete temporary file
+                            try:
+                                if os.path.exists(file_path):
+                                    os.remove(file_path)
+                            except Exception as cleanup_error:
+                                LOGGER(__name__).error(
+                                    f"Cleanup error: {cleanup_error}"
+                                )
+
+                except asyncio.CancelledError:
+                    LOGGER(__name__).info(
+                        f"Forum Topic {topic_id} download cancelled"
+                    )
+
+                    await status.edit(
+                        f"🛑 **Topic download stopped.**\n\n"
+                        f"Completed: `{completed}/{len(topic_messages)}`"
+                    )
+
+                    raise
+
+                except Exception as item_error:
+                    LOGGER(__name__).error(
+                        f"Topic message {topic_msg.id} error: "
+                        f"{item_error}"
+                    )
+
+                    continue
+
+            await status.edit(
+                f"✅ **Topic download completed!**\n\n"
+                f"Processed: `{completed}/{len(topic_messages)}` messages."
+            )
+
+            LOGGER(__name__).info(
+                f"Forum Topic {topic_id} completed: "
+                f"{completed}/{len(topic_messages)}"
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            LOGGER(__name__).error(
+                f"Topic download error for {topic_url}: {e}"
+            )
+
+            await message.reply(
+                "**❌ Failed to process Forum Topic.**"
+
+            )
 
 
 async def handle_download(bot: Client, message: Message, post_url: str):
@@ -533,6 +841,18 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             LOGGER(__name__).error(f"Unexpected error for story {story_url}: {e}")
             await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
 
+@bot.on_message(filters.command("topic") & filters.private)
+async def download_topic(bot: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply(
+            "**Provide a Forum Topic link after the /topic command.**\n\n"
+            "Example:\n"
+            "`/topic https://t.me/c/4395967213/277/292`"
+        )
+        return
+
+    topic_url = message.command[1]
+    await track_task(handle_topic_download(bot, message, topic_url))
 
 @bot.on_message(filters.command("dl") & filters.private)
 async def download_media(bot: Client, message: Message):
@@ -795,6 +1115,18 @@ async def cancel_all_tasks(_, message: Message):
             task.cancel()
             cancelled += 1
     await message.reply(f"**Cancelled {cancelled} running task(s).**")
+@bot.on_message(filters.command("stop") & filters.private)
+async def stop_downloads(_, message: Message):
+    cancelled = 0
+
+    for task in list(RUNNING_TASKS):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+
+    await message.reply(
+        f"🛑 **Stopped {cancelled} running task(s).**"
+    )
 DOWNLOAD_QUEUE = asyncio.Queue()
 QUEUE_WORKER_STARTED = False
 
